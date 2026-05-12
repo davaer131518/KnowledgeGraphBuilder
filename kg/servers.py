@@ -93,12 +93,16 @@ def start_embed_server() -> subprocess.Popen:
     return proc
 
 
-def start_llm_server() -> subprocess.Popen:
+def start_llm_server(parallel: bool = False) -> subprocess.Popen:
+    extra = ("-c", str(config.LLM_N_CTX))
+    if parallel:
+        extra += ("--parallel", str(config.LLM_PARALLEL_SLOTS))
     print(f"Starting LLM server ({config.LLM_MODEL_PATH.name}) on port {config.LLM_SERVER_PORT} …")
     proc = start_llama_server(
         config.LLM_MODEL_PATH,
         config.LLM_SERVER_PORT,
-        extra_args=("-c", str(config.LLM_N_CTX)),
+        extra_args=extra,
     )
-    print(f"LLM server ready on port {config.LLM_SERVER_PORT}.")
+    slots_msg = f" ({config.LLM_PARALLEL_SLOTS} parallel slots)" if parallel else ""
+    print(f"LLM server ready on port {config.LLM_SERVER_PORT}{slots_msg}.")
     return proc

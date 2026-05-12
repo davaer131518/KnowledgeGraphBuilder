@@ -76,3 +76,7 @@ LLM_TEMPERATURE         = 0.0    # deterministic for relation extraction
 
 BLOCK_WRITE_BATCH  = 50   # Neo4j UNWIND batch size for block nodes
 EDGE_WRITE_BATCH   = 200  # Neo4j UNWIND batch size for relationship writes
+
+# ── Parallelisation ───────────────────────────────────────────────────────────
+
+LLM_PARALLEL_SLOTS = 3   # KV-cache slots when --parallel is used; each adds ~400 MB VRAM at n_ctx=4096

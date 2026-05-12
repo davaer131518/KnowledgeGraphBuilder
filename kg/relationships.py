@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import combinations
 from typing import Any
 
@@ -357,10 +358,14 @@ def compute_refers_to_llm(
     blocks: list[dict],
     refers_to_edges: list[dict],
     regex_pairs: set[tuple[str, str]],
+    parallel: bool = False,
 ) -> list[dict]:
     """
     LLM second pass: for each table, ask the LLM which nearby paragraphs
     discuss it. Merges results into (and mutates) refers_to_edges in-place.
+
+    When parallel=True, uses a ThreadPoolExecutor so the LLM server can
+    batch decode requests concurrently (requires server started with --parallel N).
 
     Returns the updated refers_to_edges list.
     """
@@ -370,20 +375,34 @@ def compute_refers_to_llm(
     table_blocks = [b for b in blocks if b["type"] == "table"]
     print(f"Running LLM REFERS_TO second pass on {len(table_blocks)} tables …")
 
-    for tbl in tqdm(table_blocks, desc="LLM refers-to"):
+    def _process_table(tbl: dict) -> tuple[str, list[str]]:
         all_candidates = _get_nearby_blocks(tbl, blocks, page_window=1)
         candidates = [b for b in all_candidates if (b["block_id"], tbl["block_id"]) not in regex_pairs]
-        discussing = _llm_find_discussing_blocks(tbl, candidates)
+        return tbl["block_id"], _llm_find_discussing_blocks(tbl, candidates)
+
+    if parallel:
+        with ThreadPoolExecutor(max_workers=config.LLM_PARALLEL_SLOTS) as pool:
+            futures = {pool.submit(_process_table, tbl): tbl for tbl in table_blocks}
+            results: list[tuple[str, list[str]]] = []
+            for future in tqdm(as_completed(futures), total=len(table_blocks), desc="LLM refers-to"):
+                results.append(future.result())
+    else:
+        results = []
+        for tbl in tqdm(table_blocks, desc="LLM refers-to"):
+            results.append(_process_table(tbl))
+            time.sleep(0.05)
+
+    # Merge results serially — safe whether serial or parallel
+    for tbl_id, discussing in results:
         for bid in discussing:
-            pair = (bid, tbl["block_id"])
+            pair = (bid, tbl_id)
             if pair in refers_to_index:
                 if "llm" not in refers_to_index[pair]["methods"]:
                     refers_to_index[pair]["methods"].append("llm")
             else:
-                new_edge = {"src": bid, "tgt": tbl["block_id"], "methods": ["llm"], "mention": None}
+                new_edge = {"src": bid, "tgt": tbl_id, "methods": ["llm"], "mention": None}
                 refers_to_index[pair] = new_edge
                 refers_to_edges.append(new_edge)
-        time.sleep(0.05)
 
     return refers_to_edges
 
@@ -429,6 +448,7 @@ def _llm_label_table_pair(tbl_a: dict, tbl_b: dict) -> dict:
 def compute_table_pair_rels(
     blocks: list[dict],
     embeddings: dict[str, Any],
+    parallel: bool = False,
 ) -> list[dict]:
     """
     LLM-label relationships between every candidate table pair.
@@ -436,6 +456,9 @@ def compute_table_pair_rels(
     Pre-filter (AND):
       1. |page_a - page_b| <= TABLE_PAIR_PAGE_WINDOW
       2. cosine_sim(embed_a, embed_b) >= TABLE_PAIR_SEM_FLOOR
+
+    When parallel=True, uses a ThreadPoolExecutor so the LLM server can
+    batch decode requests concurrently (requires server started with --parallel N).
 
     Returns list of {src, tgt, relationship, reason} dicts (UNRELATED excluded).
     """
@@ -456,21 +479,33 @@ def compute_table_pair_rels(
         f"({n_skipped} skipped by page+similarity filter)"
     )
 
-    table_pair_rels: list[dict] = []
-    for tbl_a, tbl_b in tqdm(candidates, desc="LLM table-pairs"):
+    def _process_pair(tbl_a: dict, tbl_b: dict) -> dict | None:
         result = _llm_label_table_pair(tbl_a, tbl_b)
         rel    = result.get("relationship", "UNRELATED")
-        if rel != "UNRELATED":
-            if result.get("direction", "A_to_B") == "B_to_A":
-                src, tgt = tbl_b["block_id"], tbl_a["block_id"]
-            else:
-                src, tgt = tbl_a["block_id"], tbl_b["block_id"]
-            table_pair_rels.append({
-                "src":          src,
-                "tgt":          tgt,
-                "relationship": rel,
-                "reason":       result.get("reason", ""),
-            })
-        time.sleep(0.05)
+        if rel == "UNRELATED":
+            return None
+        if result.get("direction", "A_to_B") == "B_to_A":
+            src, tgt = tbl_b["block_id"], tbl_a["block_id"]
+        else:
+            src, tgt = tbl_a["block_id"], tbl_b["block_id"]
+        return {
+            "src":          src,
+            "tgt":          tgt,
+            "relationship": rel,
+            "reason":       result.get("reason", ""),
+        }
 
+    if parallel:
+        with ThreadPoolExecutor(max_workers=config.LLM_PARALLEL_SLOTS) as pool:
+            futures = {pool.submit(_process_pair, a, b): (a, b) for a, b in candidates}
+            raw_results: list[dict | None] = []
+            for future in tqdm(as_completed(futures), total=len(candidates), desc="LLM table-pairs"):
+                raw_results.append(future.result())
+    else:
+        raw_results = []
+        for tbl_a, tbl_b in tqdm(candidates, desc="LLM table-pairs"):
+            raw_results.append(_process_pair(tbl_a, tbl_b))
+            time.sleep(0.05)
+
+    table_pair_rels = [r for r in raw_results if r is not None]
     return table_pair_rels

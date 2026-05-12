@@ -8,6 +8,7 @@ content.
 Usage:
     python build_kg.py apple_10k
     python build_kg.py apple_10k --variant cpu
+    python build_kg.py apple_10k --parallel
 
 Reads from:
     <REPO_ROOT>/smoke_tests/<DOCUMENT>/paddle_vl_<VARIANT>/document.json
@@ -40,6 +41,16 @@ def parse_args() -> argparse.Namespace:
         "--variant", "-v",
         default="gpu",
         help="Run variant (gpu or cpu).",
+    )
+    p.add_argument(
+        "--parallel",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable parallel LLM inference via continuous batching "
+            f"(--parallel {config.LLM_PARALLEL_SLOTS} slots). "
+            "Requires ~5.5 GB VRAM. Reduces LLM pass time by ~40-50%%."
+        ),
     )
     return p.parse_args()
 
@@ -178,7 +189,7 @@ def main() -> None:
         # ── Section 3: Start servers ──────────────────────────────────────────
         print("── Starting llama servers …")
         embed_proc = servers.start_embed_server()
-        llm_proc   = servers.start_llm_server()
+        llm_proc   = servers.start_llm_server(parallel=args.parallel)
 
         # ── Section 4: Structural & regex edges ───────────────────────────────
         print("\n── Computing structural relationships …")
@@ -218,7 +229,7 @@ def main() -> None:
         # ── Section 6: REFERS_TO LLM pass ────────────────────────────────────
         print("\n── LLM REFERS_TO pass …")
         refers_to_edges = relationships.compute_refers_to_llm(
-            blocks, refers_to_edges, regex_pairs
+            blocks, refers_to_edges, regex_pairs, parallel=args.parallel
         )
         method_counts: dict[str, int] = {}
         for e in refers_to_edges:
@@ -230,7 +241,7 @@ def main() -> None:
 
         # ── Section 7: Table-pair LLM labelling ───────────────────────────────
         print("\n── LLM table-pair labelling …")
-        table_pair_rels = relationships.compute_table_pair_rels(blocks, embeddings)
+        table_pair_rels = relationships.compute_table_pair_rels(blocks, embeddings, parallel=args.parallel)
         print(f"Non-UNRELATED table-pair relationships: {len(table_pair_rels)}")
 
         # ── Section 8: Neo4j graph build ──────────────────────────────────────

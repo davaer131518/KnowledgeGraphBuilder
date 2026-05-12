@@ -60,7 +60,7 @@ All thresholds and model paths live in `config.py`. The defaults match the value
 ## Usage
 
 ```bash
-python build_kg.py <document> [--variant gpu|cpu]
+python build_kg.py <document> [--variant gpu|cpu] [--parallel]
 ```
 
 `<document>` is the subfolder name inside the Agentic PDF Parser's `smoke_tests/` directory. The script always uses the `paddle_vl` backend and defaults to the `gpu` variant:
@@ -72,9 +72,21 @@ C:\Users\David Martirosyan\Documents\Projects\Agentic PDF Parser\smoke_tests\<do
 **Examples:**
 
 ```bash
-python build_kg.py apple_10k
+python build_kg.py apple_10k                  # serial (default)
 python build_kg.py apple_10k --variant cpu
+python build_kg.py apple_10k --parallel       # parallel LLM inference
 ```
+
+### `--parallel` flag
+
+Enables continuous batching on the LLM server (`--parallel 3` slots). Both LLM passes (REFERS_TO and table-pair labelling) are submitted concurrently via a `ThreadPoolExecutor`, allowing the server to batch decode requests from multiple threads in a single GPU forward pass.
+
+| Mode | VRAM | Expected LLM pass time |
+|---|---|---|
+| Serial (default) | ~4.5 GB | ~9 min (600 pairs) |
+| `--parallel` | ~5.5 GB | ~4–5 min (~45–50% reduction) |
+
+The extra ~1 GB covers 3 additional KV-cache slots at `n_ctx=4096`. On a 12 GB card this leaves comfortable headroom.
 
 ---
 
@@ -149,6 +161,7 @@ KnowledgeGraphBuilder/
 | `EMBED_MAX_CHARS` | `6000` | Max chars sent to embed server per block (halved on 500 errors) |
 | `LLM_MAX_TOKENS` | `1024` | Max tokens per LLM completion |
 | `LLM_TEMPERATURE` | `0.0` | Deterministic LLM outputs |
+| `LLM_PARALLEL_SLOTS` | `3` | KV-cache slots when `--parallel` is used (~400 MB VRAM each) |
 
 ---
 
