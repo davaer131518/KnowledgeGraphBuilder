@@ -9,10 +9,10 @@ Converts a parsed PDF (`document.json` from the Agentic PDF Parser) into a **Neo
 The pipeline runs five complementary signal layers to build the graph:
 
 1. **Structural** — reading order, layout proximity, heading scope (no models required)
-2. **Regex** — explicit cross-references (`"see Table 2"`, `"Figure 1"`, etc.)
-3. **Embeddings** — top-K cosine similarity between tables and adjacent block types (bge-m3 via llama-server)
-4. **LLM pass 1** — identifies which nearby paragraphs discuss each table (Qwen3.5-4B)
-5. **LLM pass 2** — labels relationships between pairs of related tables (`SUPPLEMENTS`, `CONTRASTS`, `COMPARES`, `ABLATES`)
+2. **Regex** — explicit cross-references (`"see Table 2"`, `"Figure 1"`, etc.) scanned document-wide
+3. **Embeddings** — top-K cosine similarity between tables and eligible block types (bge-m3 via llama-server), computed globally across the whole document
+4. **LLM pass 1** — for each table, asks the LLM which nearby `{paragraph, caption, list_item}` blocks (within ±1 page) discuss it (Qwen3.5-4B)
+5. **LLM pass 2** — for each candidate table pair (pre-filtered by page distance ≤ 10 AND cosine similarity ≥ 0.65), labels the relationship as `SUPPLEMENTS`, `CONTRASTS`, `COMPARES`, `ABLATES`, or `UNRELATED`
 
 ---
 
@@ -102,19 +102,23 @@ The extra ~1 GB covers 3 additional KV-cache slots at `n_ctx=4096`. On a 12 GB c
 | `Page` | One node per page |
 | `Block` | One node per content block (paragraph, table, heading, figure, caption, formula, …) with a 1024-dim embedding vector |
 
+If the APOC plugin is installed, each `Block` also receives a **secondary label** matching its type (`:Table`, `:Paragraph`, `:Heading`, `:Figure`, `:Caption`, `:Formula`, etc.), enabling type-specific Cypher patterns like `MATCH (t:Table)`.
+
 ### Relationships
 
 | Relationship | Method | Description |
 |---|---|---|
+| `PART_OF` | Structural | Page → Document |
+| `ON_PAGE` | Structural | Block → Page |
 | `PRECEDES` | Structural | Reading-order chain between all consecutive blocks |
-| `DESCRIBES` | Structural | Caption → nearest table/figure (spatial proximity) |
-| `INTRODUCES` | Structural | Heading → immediately following block + any table/figure in its scope |
-| `IN_SECTION` | Structural | Every block → its deepest parent heading |
+| `DESCRIBES` | Structural | Caption → nearest table/figure on the same page (spatial proximity) |
+| `INTRODUCES` | Structural | Heading → immediately following block + any table/figure in its scope until the next heading of the same or higher level |
+| `IN_SECTION` | Structural | Every non-heading block → its deepest active parent heading |
 | `CONTEXT_BEFORE` | Structural | N blocks immediately before each table → table |
 | `CONTEXT_AFTER` | Structural | Table → N blocks immediately after it |
-| `REFERS_TO` | Regex + LLM | Block discusses/references a table; `methods` property records how it was detected (`["regex"]`, `["llm"]`, or `["llm","regex"]`) |
-| `SEMANTICALLY_SIMILAR` | Embedding | Top-K cosine neighbours per table (paragraph, figure, caption, formula, or other table); `score` property |
-| `SUPPLEMENTS` / `CONTRASTS` / `COMPARES` / `ABLATES` | LLM | Typed relationship between related table pairs |
+| `REFERS_TO` | Regex + LLM | A block discusses or references a table. `methods` property records detection source (`["regex"]`, `["llm"]`, or `["llm","regex"]`). Regex pass covers all block types document-wide; LLM pass is limited to `{paragraph, caption, list_item}` sources within ±1 page of the target table. |
+| `SEMANTICALLY_SIMILAR` | Embedding | Top-K cosine neighbours **per table** (source block is always a non-table type: paragraph, figure, caption, or formula, or another table); `score` property. Computed globally across the entire document. |
+| `SUPPLEMENTS` / `CONTRASTS` / `COMPARES` / `ABLATES` | LLM | Typed relationship between related table pairs. Requires APOC; falls back to a generic `TABLE_RELATES_TO {label, reason}` edge if APOC is unavailable. `UNRELATED` pairs are not written to the graph. |
 
 **`kg_summary.json`** — written alongside `document.json` with block counts, edge counts, `REFERS_TO` breakdown by detection method, and the full list of table-pair relationships.
 
@@ -153,8 +157,8 @@ KnowledgeGraphBuilder/
 |---|---|---|
 | `SEM_SIM_TOP_K` | `5` | Max similar blocks per table for `SEMANTICALLY_SIMILAR` |
 | `SEM_SIM_MIN_SCORE` | `0.50` | Minimum cosine score to include an edge |
-| `TABLE_PAIR_PAGE_WINDOW` | `10` | Table pairs further apart than this (pages) are skipped |
-| `TABLE_PAIR_SEM_FLOOR` | `0.65` | Table pairs below this cosine score are skipped |
+| `TABLE_PAIR_PAGE_WINDOW` | `10` | Table pairs further apart than this (pages) are skipped — applied together with `TABLE_PAIR_SEM_FLOOR` (both must pass) |
+| `TABLE_PAIR_SEM_FLOOR` | `0.65` | Table pairs with cosine similarity below this are skipped — applied together with `TABLE_PAIR_PAGE_WINDOW` (both must pass) |
 | `CONTEXT_WINDOW` | `3` | Number of blocks before/after each table for `CONTEXT_*` edges |
 | `LLM_N_CTX` | `4096` | LLM context window |
 | `EMBED_N_CTX` | `8192` | Embed model context window |
