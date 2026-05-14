@@ -7,8 +7,11 @@ Deterministic / structural edges (no models required):
     compute_precedes_edges()
     compute_describes_edges()
     compute_introduces_edges()
-    compute_in_section_edges()
     compute_context_edges()
+
+Section-anchored IN_SECTION edges (Block -> Section) are produced by
+``kg/sections.py``; ``compute_in_section_edges()`` was removed because its old
+Block -> Heading-Block semantics are superseded.
 
 Regex pass (no models required):
     build_ref_index()
@@ -206,13 +209,14 @@ def compute_introduces_edges(sorted_blocks: list[dict]) -> list[tuple[str, str]]
     return edges
 
 
-# ── 4E: IN_SECTION ───────────────────────────────────────────────────────────
+# ── 4E: IN_HEADING_SCOPE (optional legacy edge) ───────────────────────────────
 
-def compute_in_section_edges(sorted_blocks: list[dict]) -> list[tuple[str, str]]:
+def compute_in_heading_scope_edges(sorted_blocks: list[dict]) -> list[tuple[str, str]]:
     """
-    Walk blocks in reading order, tracking a {level → heading} stack.
-    Each non-heading block is linked to the deepest (largest level number)
-    active heading.
+    Optional legacy edge: each non-heading block linked to the deepest active
+    heading Block (NOT a Section). Off by default — see
+    ``config.ENABLE_IN_HEADING_SCOPE``. Provided for backwards-compatible
+    queries; the canonical hierarchy edge is now Block -> Section.
     """
     edges: list[tuple[str, str]] = []
     active: dict[int, dict] = {}
@@ -288,7 +292,23 @@ def compute_refers_to_regex(
             pair = (blk["block_id"], tgt_id)
             if pair not in seen:
                 mention = f"{ref['kind']} {ref['num']}"
-                edge = {"src": blk["block_id"], "tgt": tgt_id, "methods": ["regex"], "mention": mention}
+                # Evidence: short context window around the first mention occurrence.
+                idx = blk["raw_text"].lower().find(mention.lower())
+                if idx >= 0:
+                    ev_start = max(0, idx - 20)
+                    ev_end = min(len(blk["raw_text"]), idx + len(mention) + 20)
+                    evidence = blk["raw_text"][ev_start:ev_end].replace("\n", " ").strip()
+                else:
+                    evidence = ""
+                edge = {
+                    "src":                blk["block_id"],
+                    "tgt":                tgt_id,
+                    "methods":            ["regex"],
+                    "mention":            mention,
+                    "confidence":         config.DEFAULT_REFERS_TO_CONFIDENCE_REGEX,
+                    "evidence":           evidence,
+                    "created_by_stage":   "refers_to_regex",
+                }
                 seen[pair] = edge
                 refers_to_edges.append(edge)
 
@@ -397,10 +417,23 @@ def compute_refers_to_llm(
         for bid in discussing:
             pair = (bid, tbl_id)
             if pair in refers_to_index:
-                if "llm" not in refers_to_index[pair]["methods"]:
-                    refers_to_index[pair]["methods"].append("llm")
+                edge = refers_to_index[pair]
+                if "llm" not in edge["methods"]:
+                    edge["methods"].append("llm")
+                # When both regex and LLM agree, bump confidence.
+                if "regex" in edge["methods"] and "llm" in edge["methods"]:
+                    edge["confidence"] = config.DEFAULT_REFERS_TO_CONFIDENCE_BOTH
+                    edge["created_by_stage"] = "refers_to_regex+llm"
             else:
-                new_edge = {"src": bid, "tgt": tbl_id, "methods": ["llm"], "mention": None}
+                new_edge = {
+                    "src":              bid,
+                    "tgt":              tbl_id,
+                    "methods":          ["llm"],
+                    "mention":          None,
+                    "confidence":       config.DEFAULT_REFERS_TO_CONFIDENCE_LLM,
+                    "evidence":         "",
+                    "created_by_stage": "refers_to_llm",
+                }
                 refers_to_index[pair] = new_edge
                 refers_to_edges.append(new_edge)
 
@@ -489,10 +522,15 @@ def compute_table_pair_rels(
         else:
             src, tgt = tbl_a["block_id"], tbl_b["block_id"]
         return {
-            "src":          src,
-            "tgt":          tgt,
-            "relationship": rel,
-            "reason":       result.get("reason", ""),
+            "src":              src,
+            "tgt":              tgt,
+            "relationship":     rel,
+            "reason":           result.get("reason", ""),
+            "methods":          ["llm"],
+            "model":            config.LLM_MODEL_NAME,
+            "scope":            "table",
+            "confidence":       config.DEFAULT_TABLE_PAIR_CONFIDENCE,
+            "created_by_stage": "table_pair_llm",
         }
 
     if parallel:

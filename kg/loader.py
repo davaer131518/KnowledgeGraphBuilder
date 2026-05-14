@@ -102,6 +102,14 @@ def load_document(doc_json_path: Path) -> tuple[dict, list[dict[str, Any]], dict
     return raw_doc, blocks, block_by_id
 
 
+def iter_content_blocks(blocks: list[dict], allowed_types: tuple[str, ...]):
+    """Yield only blocks whose type is in ``allowed_types``."""
+    allowed = set(allowed_types)
+    for b in blocks:
+        if b["type"] in allowed:
+            yield b
+
+
 def print_block_summary(blocks: list[dict]) -> None:
     """Print a type-count breakdown of the loaded blocks."""
     counts: dict[str, int] = {}

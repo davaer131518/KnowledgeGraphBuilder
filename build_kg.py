@@ -23,7 +23,16 @@ from pathlib import Path
 from neo4j import GraphDatabase
 
 import config
-from kg import loader, servers, relationships, embeddings as emb_module, neo4j_writer
+from kg import (
+    loader,
+    servers,
+    relationships,
+    embeddings as emb_module,
+    neo4j_writer,
+    sections as sections_module,
+    entities as entities_module,
+    similarity as similarity_module,
+)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -67,6 +76,10 @@ def print_terminal_summary(
     refers_to_edges: list[dict],
     table_pair_rels: list[dict],
     summary_path: Path,
+    sections: list[dict] | None = None,
+    entities: list[dict] | None = None,
+    global_sim_skip: dict | None = None,
+    spacy_enabled: bool = False,
 ) -> None:
     """Print a rich summary to the terminal after the graph is built."""
     run_query = neo4j_writer.make_runner(driver)
@@ -95,6 +108,32 @@ def print_terminal_summary(
     for row in rel_rows:
         print(f"  {row['rel_type']:<30} {row['count']}")
 
+    # Sections summary
+    if sections:
+        print(f"\nSection nodes: {len(sections)} (max depth {max(s['level'] for s in sections)})")
+
+    # Entities summary
+    if entities:
+        print(f"\nEntity nodes: {len(entities)}  (spaCy active: {spacy_enabled})")
+        by_type: dict[str, int] = {}
+        for e in entities:
+            by_type[e["type"]] = by_type.get(e["type"], 0) + 1
+        for t, c in sorted(by_type.items(), key=lambda kv: -kv[1]):
+            print(f"  {t:<20} : {c}")
+
+    # SEMANTICALLY_SIMILAR by scope
+    scope_rows = run_query("""
+        MATCH ()-[r:SEMANTICALLY_SIMILAR]->()
+        RETURN coalesce(r.scope, 'unknown') AS scope, count(r) AS count
+        ORDER BY scope
+    """)
+    if scope_rows:
+        print("\nSEMANTICALLY_SIMILAR by scope:")
+        for row in scope_rows:
+            print(f"  {row['scope']:<10} : {row['count']}")
+    if global_sim_skip and global_sim_skip.get("skipped"):
+        print(f"  [global similarity skipped: {global_sim_skip.get('reason')}]")
+
     # REFERS_TO method breakdown
     method_counts: dict[str, int] = {}
     for e in refers_to_edges:
@@ -113,7 +152,7 @@ def print_terminal_summary(
         MATCH (b:Block {type: 'table'})
         OPTIONAL MATCH (x)-[rx:REFERS_TO]->(b) WHERE 'regex' IN rx.methods
         OPTIONAL MATCH (y)-[ry:REFERS_TO]->(b) WHERE 'llm'   IN ry.methods
-        OPTIONAL MATCH (z)-[:SEMANTICALLY_SIMILAR]->(b)
+        OPTIONAL MATCH (z)-[:SEMANTICALLY_SIMILAR]-(b)
         OPTIONAL MATCH (c)-[:DESCRIBES]->(b)
         OPTIONAL MATCH (b)-[:IN_SECTION]->(h)
         RETURN b.block_id AS table_id,
@@ -122,7 +161,7 @@ def print_terminal_summary(
                count(DISTINCT y) AS llm_refs,
                count(DISTINCT z) AS sem_sim,
                count(DISTINCT c) AS captions,
-               h.text            AS section
+               coalesce(h.title, h.text) AS section
         ORDER BY regex_refs + llm_refs DESC
     """)
     for row in table_rows:
@@ -178,7 +217,7 @@ def main() -> None:
     driver     = None
 
     try:
-        # ── Section 2: Load document ──────────────────────────────────────────
+        # ── 1. Load document ──────────────────────────────────────────────────
         print("── Loading document …")
         raw_doc, blocks, block_by_id = loader.load_document(doc_json)
         loader.print_block_summary(blocks)
@@ -186,12 +225,21 @@ def main() -> None:
         print(f"Backend : {raw_doc['backend']['name']} {raw_doc['backend']['version']}")
         print(f"Source  : {raw_doc['document']['source_filename']}\n")
 
-        # ── Section 3: Start servers ──────────────────────────────────────────
-        print("── Starting llama servers …")
-        embed_proc = servers.start_embed_server()
-        llm_proc   = servers.start_llm_server(parallel=args.parallel)
+        doc_sha = raw_doc["document"]["source_sha256"]
 
-        # ── Section 4: Structural & regex edges ───────────────────────────────
+        # ── 2. Sections (CPU-only) ────────────────────────────────────────────
+        sections = parent_child_pairs = top_level_sections = None
+        in_section_edges: list[tuple[str, str]] = []
+        if config.ENABLE_SECTIONS:
+            print("── Building sections …")
+            sections, in_section_edges, parent_child_pairs, top_level_sections = (
+                sections_module.build_sections(blocks, doc_sha)
+            )
+            print(f"Sections        : {len(sections)} "
+                  f"(top-level={len(top_level_sections)}, subsection-edges={len(parent_child_pairs)})")
+            print(f"IN_SECTION      : {len(in_section_edges)}")
+
+        # ── 3. Structural & regex edges (CPU-only) ────────────────────────────
         print("\n── Computing structural relationships …")
         ref_index = relationships.build_ref_index(blocks)
         print(f"Reference index entries: {len(ref_index)}")
@@ -199,34 +247,68 @@ def main() -> None:
         precedes_edges  = relationships.compute_precedes_edges(blocks)
         describes_edges = relationships.compute_describes_edges(blocks)
         introduces_edges = relationships.compute_introduces_edges(blocks)
-        in_section_edges = relationships.compute_in_section_edges(blocks)
         context_before_edges, context_after_edges = relationships.compute_context_edges(blocks)
+
+        in_heading_scope_edges: list[tuple[str, str]] = []
+        if config.ENABLE_IN_HEADING_SCOPE:
+            in_heading_scope_edges = relationships.compute_in_heading_scope_edges(blocks)
+            print(f"IN_HEADING_SCOPE: {len(in_heading_scope_edges)}")
 
         print(f"PRECEDES        : {len(precedes_edges)}")
         print(f"DESCRIBES       : {len(describes_edges)}")
         print(f"INTRODUCES      : {len(introduces_edges)}")
-        print(f"IN_SECTION      : {len(in_section_edges)}")
         print(f"CONTEXT_BEFORE  : {len(context_before_edges)}")
         print(f"CONTEXT_AFTER   : {len(context_after_edges)}")
 
         refers_to_edges, regex_pairs = relationships.compute_refers_to_regex(blocks, ref_index)
         print(f"REFERS_TO (regex): {len(refers_to_edges)}")
 
-        # ── Section 5: Embeddings ─────────────────────────────────────────────
-        print("\n── Generating embeddings …")
-        doc_sha    = raw_doc["document"]["source_sha256"]
-        embeddings = emb_module.compute_or_load_embeddings(blocks, doc_sha, doc_json.parent)
+        # ── 4. Entity extraction (CPU-only) ───────────────────────────────────
+        entities: list[dict] = []
+        mention_edges: list[dict] = []
+        if config.ENABLE_ENTITIES:
+            print("\n── Extracting entities …")
+            entities, mention_edges = entities_module.extract_entities(blocks, doc_sha)
+            print(f"Entities        : {len(entities)}")
+            print(f"MENTIONS        : {len(mention_edges)}")
+        spacy_enabled = entities_module.is_spacy_active() if config.ENABLE_ENTITIES else False
 
-        # Kill embed server to free VRAM before LLM sections
+        # ── 5–7. Embeddings (embed server up briefly) ─────────────────────────
+        print("\n── Generating embeddings …")
+        embed_proc = servers.start_embed_server()
+        embeddings = emb_module.compute_or_load_embeddings(blocks, doc_sha, doc_json.parent)
         print("Stopping embed server to free VRAM …")
         servers.stop_server(embed_proc)
         embed_proc = None
         print("Embed server stopped.")
 
-        semantic_edges = emb_module.compute_semantic_edges(blocks, embeddings)
-        print(f"SEMANTICALLY_SIMILAR: {len(semantic_edges)}")
+        # ── 8. Table-anchored semantic similarity (CPU-only) ──────────────────
+        print("\n── Computing table-anchored semantic similarity …")
+        table_sem_raw = emb_module.compute_semantic_edges(blocks, embeddings)
+        table_sem_edges = emb_module.table_edges_to_dicts(table_sem_raw)
+        print(f"SEMANTICALLY_SIMILAR (table scope): {len(table_sem_edges)}")
 
-        # ── Section 6: REFERS_TO LLM pass ────────────────────────────────────
+        # ── 9. Global block-to-block similarity (CPU-only) ────────────────────
+        global_sem_edges: list[dict] = []
+        global_sim_skip = {"skipped": True, "reason": "ENABLE_GLOBAL_BLOCK_SIM=False", "filtered_count": 0}
+        if config.ENABLE_GLOBAL_BLOCK_SIM:
+            print("\n── Computing global block-to-block similarity …")
+            mentions_by_block: dict[str, int] = {}
+            for m in mention_edges:
+                mentions_by_block[m["src"]] = mentions_by_block.get(m["src"], 0) + 1
+            global_sem_edges, global_sim_skip = similarity_module.compute_global_block_similarity(
+                blocks, embeddings, table_sem_raw, mentions_by_block,
+            )
+            print(f"SEMANTICALLY_SIMILAR (global scope): {len(global_sem_edges)}")
+            if global_sim_skip.get("skipped"):
+                print(f"  [skipped] {global_sim_skip.get('reason')}")
+
+        all_semantic_edges = table_sem_edges + global_sem_edges
+
+        # ── 10–13. LLM passes (LLM server up briefly) ─────────────────────────
+        print("\n── Starting LLM server …")
+        llm_proc = servers.start_llm_server(parallel=args.parallel)
+
         print("\n── LLM REFERS_TO pass …")
         refers_to_edges = relationships.compute_refers_to_llm(
             blocks, refers_to_edges, regex_pairs, parallel=args.parallel
@@ -239,12 +321,23 @@ def main() -> None:
         for k, v in sorted(method_counts.items()):
             print(f"  method={k}: {v}")
 
-        # ── Section 7: Table-pair LLM labelling ───────────────────────────────
         print("\n── LLM table-pair labelling …")
         table_pair_rels = relationships.compute_table_pair_rels(blocks, embeddings, parallel=args.parallel)
         print(f"Non-UNRELATED table-pair relationships: {len(table_pair_rels)}")
 
-        # ── Section 8: Neo4j graph build ──────────────────────────────────────
+        print("\nStopping LLM server …")
+        servers.stop_server(llm_proc)
+        llm_proc = None
+        print("LLM server stopped.")
+
+        # ── 14. (Optional) SHARES_ENTITY_WITH (CPU-only) ──────────────────────
+        shares_entity_pairs: list[dict] = []
+        if config.CREATE_SHARES_ENTITY_WITH and entities:
+            print("\n── Computing SHARES_ENTITY_WITH edges …")
+            shares_entity_pairs = entities_module.compute_shares_entity_with(entities, mention_edges)
+            print(f"SHARES_ENTITY_WITH: {len(shares_entity_pairs)}")
+
+        # ── 15–16. Neo4j graph build + summary ────────────────────────────────
         print("\n── Connecting to Neo4j …")
         driver = GraphDatabase.driver(
             config.NEO4J_URI, auth=(config.NEO4J_USER, config.NEO4J_PASSWORD)
@@ -265,15 +358,32 @@ def main() -> None:
             context_before_edges  = context_before_edges,
             context_after_edges   = context_after_edges,
             refers_to_edges       = refers_to_edges,
-            semantic_edges        = semantic_edges,
+            semantic_edges        = all_semantic_edges,
             table_pair_rels       = table_pair_rels,
             output_dir            = doc_json.parent,
             backend               = backend,
             run_variant           = run_variant,
+            sections              = sections,
+            parent_child_pairs    = parent_child_pairs,
+            top_level_sections    = top_level_sections,
+            in_heading_scope_edges = in_heading_scope_edges,
+            entities              = entities,
+            mention_edges         = mention_edges,
+            table_sem_edges       = table_sem_edges,
+            global_sem_edges      = global_sem_edges,
+            global_sim_skip       = global_sim_skip,
+            shares_entity_pairs   = shares_entity_pairs,
+            spacy_enabled         = spacy_enabled,
         )
 
         # ── Terminal summary ──────────────────────────────────────────────────
-        print_terminal_summary(driver, blocks, refers_to_edges, table_pair_rels, summary_path)
+        print_terminal_summary(
+            driver, blocks, refers_to_edges, table_pair_rels, summary_path,
+            sections=sections,
+            entities=entities,
+            global_sim_skip=global_sim_skip,
+            spacy_enabled=spacy_enabled,
+        )
 
     finally:
         # Always attempt clean shutdown of servers and Neo4j driver

@@ -80,3 +80,81 @@ EDGE_WRITE_BATCH   = 200  # Neo4j UNWIND batch size for relationship writes
 # ── Parallelisation ───────────────────────────────────────────────────────────
 
 LLM_PARALLEL_SLOTS = 3   # KV-cache slots when --parallel is used; each adds ~400 MB VRAM at n_ctx=4096
+
+# ── Sections ──────────────────────────────────────────────────────────────────
+
+ENABLE_SECTIONS                            = True
+SECTION_FALLBACK_TITLE                     = "<document root>"
+SECTION_PATH_MAX_DEPTH                     = 6      # truncate path to avoid huge strings
+SECTION_EMIT_SYNTHETIC_ROOT_IF_NO_HEADINGS = True   # synthesise a root section for heading-less docs
+ENABLE_IN_HEADING_SCOPE                    = False  # optional legacy (:Block)-[:IN_HEADING_SCOPE]->(:Block)
+
+# ── Entities ──────────────────────────────────────────────────────────────────
+
+ENABLE_ENTITIES                       = True
+ENTITY_MIN_TERM_LEN                   = 3
+ENTITY_MIN_CONFIDENCE                 = 0.5
+ENTITY_MAX_ENTITIES_PER_BLOCK         = 50
+ENTITY_MAX_SPANS_PER_MENTION          = 5
+ENTITY_EVIDENCE_MAX_CHARS             = 120
+ENTITY_MAX_DOCUMENT_FREQUENCY_RATIO   = 0.25   # TERMs above this ratio get demoted to confidence 0.2
+ENTITY_USE_SPACY                      = True   # opt-in; falls back gracefully if spaCy is not installed
+ENTITY_SPACY_MODEL                    = "en_core_web_sm"
+ENTITY_SPACY_MIN_CONFIDENCE           = 0.6
+ENTITY_SPACY_TEXT_MAX_CHARS           = 10000  # truncate per-block text before NER
+
+# Common English stopwords + generic doc-vocabulary words filtered from rule-based TERM/ORG extraction.
+ENTITY_STOPWORD_BLOCKLIST: frozenset[str] = frozenset({
+    "the", "a", "an", "and", "or", "but", "if", "while", "with", "without",
+    "of", "in", "on", "at", "to", "from", "for", "by", "as", "is", "are",
+    "was", "were", "be", "been", "being", "this", "that", "these", "those",
+    "it", "its", "they", "them", "their", "we", "our", "you", "your",
+    "he", "she", "his", "her", "i", "me", "my", "have", "has", "had",
+    "do", "does", "did", "will", "would", "should", "could", "may", "might",
+    "must", "shall", "can", "not", "no", "yes", "any", "all", "some", "such",
+    "than", "then", "so", "also", "more", "most", "less", "least", "very",
+    "much", "many", "few", "each", "every", "either", "neither", "both",
+    "other", "another", "same", "different", "new", "old",
+})
+
+# Generic document-vocabulary terms that should never become TERM entities.
+ENTITY_GENERIC_TERMS: frozenset[str] = frozenset({
+    "company", "table", "figure", "section", "chapter", "paragraph",
+    "document", "report", "page", "appendix", "introduction", "overview",
+    "summary", "conclusion", "abstract", "background", "discussion",
+    "results", "method", "methods", "methodology", "analysis", "data",
+    "information", "services", "service", "business", "operations",
+    "management", "directors", "officers", "employees", "shareholders",
+    "fiscal", "year", "years", "quarter", "period", "date", "note", "notes",
+    "item", "items", "exhibit", "schedule", "form",
+})
+
+# ── Global block-to-block semantic similarity ─────────────────────────────────
+
+ENABLE_GLOBAL_BLOCK_SIM         = True
+BLOCK_SIM_TOP_K                 = 5
+BLOCK_SIM_MIN_SCORE             = 0.70
+BLOCK_SIM_ALLOWED_TYPES         = (
+    "paragraph", "list_item", "caption", "figure", "formula", "table", "heading",
+)
+BLOCK_SIM_SKIP_SHORT_TEXT_CHARS = 40
+BLOCK_SIM_MAX_BLOCKS            = 8000   # warn-and-skip threshold; no chunked fallback
+BLOCK_SIM_SKIP_SAME_PAGE        = False  # set True to discard trivially-near pairs
+
+# ── Entity-mediated edges (optional, off by default) ──────────────────────────
+
+CREATE_SHARES_ENTITY_WITH            = False
+SHARED_ENTITY_MAX_BLOCKS_PER_ENTITY  = 8
+SHARED_ENTITY_MIN_ENTITY_CONFIDENCE  = 0.75
+SHARED_ENTITY_ALLOWED_TYPES          = ("ORG", "PERSON", "LAW_OR_REGULATION", "TERM", "ACRONYM")
+SHARED_ENTITY_MAX_PAIRS              = 5000   # global cap
+
+# ── Provenance defaults ───────────────────────────────────────────────────────
+
+DEFAULT_REFERS_TO_CONFIDENCE_REGEX = 0.9
+DEFAULT_REFERS_TO_CONFIDENCE_LLM   = 0.85
+DEFAULT_REFERS_TO_CONFIDENCE_BOTH  = 0.95
+DEFAULT_TABLE_PAIR_CONFIDENCE      = 0.8
+
+LLM_MODEL_NAME   = "qwen3.5-4b"
+EMBED_MODEL_NAME = "bge-m3"

@@ -110,3 +110,25 @@ def compute_semantic_edges(
                 semantic_edges.append((other_id, tbl_id, round(score, 4)))
 
     return semantic_edges
+
+
+def table_edges_to_dicts(
+    table_edges: list[tuple[str, str, float]],
+) -> list[dict]:
+    """
+    Convert table-anchored semantic edges (3-tuples) into the dict format used
+    by the unified SEMANTICALLY_SIMILAR Neo4j writer. Adds provenance fields
+    so the writer can SET them uniformly with the global-scope edges.
+    """
+    out: list[dict] = []
+    for rank_within_table, (src, tgt, score) in enumerate(table_edges, start=1):
+        out.append({
+            "src":              src,
+            "tgt":              tgt,
+            "score":            score,
+            "rank":             rank_within_table,
+            "scope":            "table",
+            "confidence":       score,
+            "stage":            "table_similarity",
+        })
+    return out
